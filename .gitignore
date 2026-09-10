@@ -1,0 +1,40 @@
+# 本机补丁记录包含绝对路径；上游源码备份不提交
+/compat/installed.json
+/compat/originals/
+
+# 运行配置、认证与会话数据
+.env
+.env.*
+!.env.example
+/command-audit.json
+/settings.json
+/auth.json
+/credentials.json
+/mcp.json
+/mcp-cache.json
+/.pi/
+/sessions/
+/command-audit-logs/
+/command-audit-backups/
+/logs/
+/backups/
+/staging/
+*.log
+*.jsonl
+*.bak
+*.tmp
+*.tgz
+
+# 依赖、构建与测试产物
+node_modules/
+dist/
+coverage/
+.nyc_output/
+*.tsbuildinfo
+
+# 编辑器与操作系统文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini

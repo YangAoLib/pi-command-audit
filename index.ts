@@ -1,0 +1,205 @@
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
+import { createHash, randomUUID } from "node:crypto";
+import { verifySubagentBridge } from "./subagent-bridge.ts";
+import { startApprovalBroker, type ApprovalBroker } from "./external-approval.ts";
+import { approvalReason, countOutcome, formatAuditStatus, notifyBlocked, requestApproval, type AuditOutcome } from "./approval-ui.ts";
+import {
+  DEFAULT_CONFIG, REVIEW_PROMPT, localDecision, parseConfig, parseVerdict, redact, redactText,
+  type AuditRequest, type Config, type Decision,
+} from "./policy.ts";
+
+export const MCP_APPROVAL_EVENT = "pi-mcp-adapter:tool-approval-request";
+interface McpApprovalRequest {
+  serverName: string;
+  originalToolName: string;
+  prefixedToolName: string;
+  args: Record<string, unknown>;
+  origin: string;
+  signal?: AbortSignal;
+  claim(handler: () => Promise<"allow_once" | "deny">): boolean;
+}
+
+// 使用事件契约而不是导入另一个全局插件的内部模块，避免模块解析和重复加载问题。
+export default function commandAudit(pi: ExtensionAPI) {
+  const agentDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+  const configPath = join(agentDir, "command-audit.json");
+  let ctxCurrent: ExtensionContext | undefined;
+  let lifetime = new AbortController();
+  let config: Config = DEFAULT_CONFIG;
+  let configError = false;
+  let confirmationQueue: Promise<unknown> = Promise.resolve();
+  let counters = { allowed: 0, denied: 0, cancelled: 0 };
+  let approvalBroker: ApprovalBroker | undefined;
+
+  function loadConfig() {
+    configError = false;
+    try { config = parseConfig(JSON.parse(readFileSync(configPath, "utf8"))); }
+    catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") config = DEFAULT_CONFIG;
+      else configError = true;
+    }
+  }
+
+  function auditLog(r: AuditRequest, ctx: ExtensionContext, result: Decision, allowed: boolean, outcome: AuditOutcome) {
+    const dir = join(agentDir, "command-audit-logs");
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    // 不保存命令、路径、参数、模型理由或用户对话，避免日志二次泄漏。
+    appendFileSync(join(dir, `${new Date().toISOString().slice(0, 10)}-${process.pid}.jsonl`), JSON.stringify({
+      time: new Date().toISOString(), sessionId: ctx.sessionManager.getSessionId(),
+      kind: r.kind, requestHash: createHash("sha256").update(JSON.stringify(r)).digest("hex"),
+      decision: result.decision, allowed, outcome,
+    }) + "\n", { mode: 0o600 });
+  }
+
+  async function classify(r: AuditRequest, ctx: ExtensionContext, signal: AbortSignal): Promise<Decision> {
+    signal.throwIfAborted();
+    if (configError) return { decision: "deny", reason: "全局审核配置无效，请用户修复后 /reload" };
+    if (r.kind === "tool" && r.tool === "subagent" && !["list", "status", "guide"].includes(String(r.args.action))) {
+      const bridge = verifySubagentBridge();
+      if (!bridge.ok) return { decision: "deny", reason: bridge.reason };
+    }
+    const local = localDecision(r, config, agentDir);
+    if (local) return local;
+    if (r.kind === "tool" && r.tool === "subagent" &&
+        (r.args.workflowScript !== undefined || r.args.workflowScriptPath !== undefined || r.args.workflow !== undefined)) {
+      return { decision: "ask", reason: "子代理内部命令会分别审核；工作流还可能包含 runs.host 等主机操作，需要核对完整工作流" };
+    }
+    const model = config.model === "current" ? ctx.model : ctx.modelRegistry.find(config.model.provider, config.model.id);
+    if (!model) return { decision: "deny", reason: "审核模型不可用" };
+    const payload = JSON.stringify(redact(r));
+    if (payload.length > config.maxInputChars) return { decision: "deny", reason: "审核上下文过长，请拆分操作" };
+    const response = await ctx.modelRegistry.complete(model, {
+      systemPrompt: REVIEW_PROMPT,
+      messages: [{ role: "user", content: [{ type: "text", text: payload }], timestamp: Date.now() }],
+    }, { signal, maxTokens: 1024, cacheRetention: "none", sessionId: randomUUID() });
+    signal.throwIfAborted();
+    if (response.stopReason !== "stop" || response.content.some(c => c.type === "toolCall")) throw new Error("审核未正常结束");
+    return parseVerdict(response.content.filter(c => c.type === "text").map(c => c.text).join("\n"));
+  }
+
+  async function review(r: AuditRequest, ctx: ExtensionContext, extraSignal?: AbortSignal, dryRun = false): Promise<Decision & { allowed: boolean }> {
+    const active = AbortSignal.any([lifetime.signal, ...[ctx.signal, extraSignal].filter((s): s is AbortSignal => !!s)]);
+    const timeout = new AbortController();
+    const timer = setTimeout(() => timeout.abort(), config.timeoutMs);
+    const modelSignal = AbortSignal.any([active, timeout.signal]);
+    let result: Decision;
+    try {
+      // 即使自定义 provider 忽略 signal，也在超时/取消时终止等待，不放行工具。
+      result = await new Promise<Decision>((resolve, reject) => {
+        const abort = () => reject(new Error("审核取消或超时"));
+        modelSignal.addEventListener("abort", abort, { once: true });
+        if (modelSignal.aborted) { abort(); return; }
+        classify(r, ctx, modelSignal).then(resolve, reject).finally(() => modelSignal.removeEventListener("abort", abort));
+      });
+    } catch {
+      result = { decision: "deny", reason: "审核失败、超时、取消或返回格式无效，已阻止执行" };
+    } finally { clearTimeout(timer); }
+    let allowed = result.decision === "allow" && !active.aborted;
+    let outcome: AuditOutcome = active.aborted ? "cancelled" : allowed ? "allowed" : "denied";
+    let finalReason = result.reason;
+    if (!dryRun && result.decision === "ask") {
+      const confirm = confirmationQueue.then(() => requestApproval(ctx, "命令审核 · 请确认本次操作",
+        `${result.reason}\n\n${JSON.stringify(redact(r), null, 2)}`, active, config.confirmTimeoutMs));
+      confirmationQueue = confirm.catch(() => undefined);
+      outcome = await confirm;
+      allowed = outcome === "approved" && !active.aborted;
+      if (active.aborted) { outcome = "cancelled"; allowed = false; }
+      finalReason = approvalReason(outcome);
+    } else if (active.aborted) { finalReason = approvalReason("cancelled"); }
+    if (dryRun) return { ...result, allowed };
+    // 保留初审分类，同时单独记录最终结果，避免 ask 被误认为已批准。
+    try { auditLog(r, ctx, result, allowed, outcome); }
+    catch { allowed = false; outcome = "error"; finalReason = "无法写入审核日志，已阻止执行"; }
+    countOutcome(counters, allowed, outcome);
+    if (ctx.hasUI) {
+      ctx.ui.setStatus("command-audit", formatAuditStatus(ctx, counters));
+      if (!allowed) notifyBlocked(ctx, redactText(r.tool), finalReason, outcome);
+    }
+    return { ...result, reason: finalReason, allowed };
+  }
+
+  // 扩展目录不是默认技能扫描目录，通过资源发现注册随扩展维护的技能。
+  pi.on("resources_discover", () => ({
+    skillPaths: [fileURLToPath(new URL("./skills/command-audit-subagent-upgrade/SKILL.md", import.meta.url))],
+  }));
+
+  loadConfig();
+  pi.on("session_start", async (_event, ctx) => {
+    ctxCurrent = ctx;
+    lifetime.abort();
+    lifetime = new AbortController();
+    counters = { allowed: 0, denied: 0, cancelled: 0 };
+    loadConfig();
+    await approvalBroker?.close();
+    approvalBroker = undefined;
+    if (ctx.hasUI && !configError) {
+      try {
+        approvalBroker = await startApprovalBroker(async (preview, signal) => {
+          const active = AbortSignal.any([lifetime.signal, signal]);
+          const pending = confirmationQueue.then(() => requestApproval(ctx, "外部 runner · 是否允许本次启动？",
+            "此确认仅允许本次外部启动。其内部命令不经过 Pi 逐条审核，请依赖该 CLI/provider 自身的权限与沙箱。\n\n" + preview,
+            active, config.confirmTimeoutMs));
+          confirmationQueue = pending.catch(() => undefined);
+          const outcome = await pending;
+          const allowed = outcome === "approved" && !active.aborted;
+          countOutcome(counters, allowed, outcome);
+          ctx.ui.setStatus("command-audit", formatAuditStatus(ctx, counters));
+          if (!allowed) notifyBlocked(ctx, "外部 runner", approvalReason(outcome), outcome);
+          return allowed;
+        }, config.confirmTimeoutMs);
+      } catch { ctx.ui.notify("外部 runner 人工确认服务启动失败，将阻止外部启动", "warning"); }
+    }
+    if (ctx.hasUI) {
+      ctx.ui.setStatus("command-audit", configError ? ctx.ui.theme.fg("error", "审核配置错误：阻止执行") : formatAuditStatus(ctx, counters));
+      const bridge = verifySubagentBridge();
+      if (!bridge.ok) ctx.ui.notify(bridge.reason, "warning");
+    }
+  });
+  pi.on("session_shutdown", async () => {
+    lifetime.abort(); ctxCurrent = undefined;
+    await approvalBroker?.close(); approvalBroker = undefined;
+  });
+
+  pi.on("tool_call", async (event, ctx) => {
+    ctxCurrent = ctx;
+    // MCP 在实际调用边界审核，包含脚本动态生成的每次调用，不只审核外层代码。
+    // 不根据工具名前缀跳过其它工具：直接工具会再次经过 MCP 审批，保守处理。
+    if (event.toolName === "mcpScript") return;
+    if (event.toolName === "mcp") {
+      const input = event.input as Record<string, unknown>;
+      if (!input.action || input.action === "ui-messages") return;
+    }
+    const result = await review({ kind: "tool", tool: event.toolName,
+      args: event.input as Record<string, unknown>, cwd: ctx.cwd }, ctx);
+    if (!result.allowed) return { block: true, reason: `命令审核阻止：${result.reason}`, terminate: true };
+  });
+
+  pi.events.on(MCP_APPROVAL_EVENT, (payload: unknown) => {
+    const request = payload as McpApprovalRequest;
+    if (!request || typeof request.claim !== "function") return;
+    // claim 必须同步调用；异步审核放在回调内。绝不 abstain 或 allow_for_session。
+    request.claim(async () => {
+      const ctx = ctxCurrent;
+      if (!ctx || lifetime.signal.aborted) return "deny";
+      const result = await review({ kind: "mcp", tool: request.originalToolName,
+        server: request.serverName, origin: request.origin, args: request.args ?? {}, cwd: ctx.cwd }, ctx, request.signal);
+      return result.allowed ? "allow_once" : "deny";
+    });
+  });
+
+  pi.registerCommand("command-audit", {
+    description: "查看命令审核状态；test <命令> 只审核而不执行",
+    handler: async (args, ctx) => {
+      if (args.startsWith("test ")) {
+        const result = await review({ kind: "tool", tool: "bash", args: { command: args.slice(5) }, cwd: ctx.cwd }, ctx, undefined, true);
+        ctx.ui.notify(`${result.decision}：${result.reason}（未执行）`, result.decision === "allow" ? "info" : "warning");
+        return;
+      }
+      ctx.ui.notify(`命令审核：${configError ? "配置错误，默认拒绝" : "已启用"}\n模型：${config.model === "current" ? "跟随当前会话" : config.model.provider + "/" + config.model.id}\n配置：${configPath}\nMCP：逐调用审批；Subagent：${verifySubagentBridge().reason}\n不拦截用户手输的 !/!!，不构成操作系统沙箱。`, "info");
+    },
+  });
+}
