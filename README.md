@@ -161,7 +161,7 @@ node ~/.pi/agent/extensions/pi-command-audit/compat/install.mjs
 ## 其它边界
 
 - 用户手动输入的 `!` / `!!` 命令不审核，便于用户维护配置。
-- 普通 AI `write/edit` 不能直接修改 Pi 全局目录；模型规则还会检查 shell/MCP 中的配置修改，但这不是完整的自修改防御。
+- AI `write/edit` 修改 Pi 全局目录不再因目录位置直接拒绝。全局 Skill、AGENTS.md、插件源码、配置和 npm 依赖文件继续交给模型按修改内容审核：`allow` 放行，`ask` 人工确认，`deny` 阻止。影响执行行为、权限或审核机制的维护变更要求模型返回 `ask`；明显恶意的审核绕过仍可拒绝。常见凭据文件（如 auth.json、.env）的独立拒绝规则及参数长度上限保持不变。这不是完整的自修改防御。
 - 已加载的可信扩展使用 `pi.exec`、Node 文件 API 或进程 API 的内部操作不一定触发工具事件。其它后置事件处理器也可改变参数。插件不能防御同进程的恶意扩展。
 - 日志只记录时间、会话 ID、类型、请求 SHA-256、初审决定、最终结果分类和是否放行，不记录原始参数、路径、工具名、理由或对话。位置为 `~/.pi/agent/command-audit-logs/YYYY-MM-DD-PID.jsonl`。日志没有自动清理，按需由用户清理；Windows 权限取决于父目录 ACL。
 

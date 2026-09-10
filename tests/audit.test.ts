@@ -8,18 +8,18 @@ import { DEFAULT_CONFIG, localDecision, parseConfig, parseVerdict, redact, type 
 
 const request = (command: string): AuditRequest => ({ kind: "tool", tool: "bash", cwd: process.cwd(), args: { command } });
 for (const command of ["pwd", "git status --short", "git diff --stat"]) {
-  test(`精确规则放行：${command}`, () => assert.equal(localDecision(request(command), DEFAULT_CONFIG, tmpdir())?.decision, "allow"));
+  test(`精确规则放行：${command}`, () => assert.equal(localDecision(request(command), DEFAULT_CONFIG)?.decision, "allow"));
 }
 for (const command of ["pwd; echo unsafe", "git status $(echo unsafe)", "git diff --stat > output", "ls --help", "node -e 'process.exit()'"]) {
-  test(`复合或未知命令不能命中白名单：${command}`, () => assert.notEqual(localDecision(request(command), DEFAULT_CONFIG, tmpdir())?.decision, "allow"));
+  test(`复合或未知命令不能命中白名单：${command}`, () => assert.notEqual(localDecision(request(command), DEFAULT_CONFIG)?.decision, "allow"));
 }
 for (const command of ["rm -rf ./build", "git push origin main", "sudo echo test", "Remove-Item ./build"]) {
-  test(`风险命令需要确认：${command}`, () => assert.equal(localDecision(request(command), DEFAULT_CONFIG, tmpdir())?.decision, "ask"));
+  test(`风险命令需要确认：${command}`, () => assert.equal(localDecision(request(command), DEFAULT_CONFIG)?.decision, "ask"));
 }
-test("磁盘破坏直接拒绝", () => assert.equal(localDecision(request("mkfs /dev/example"), DEFAULT_CONFIG, tmpdir())?.decision, "deny"));
-test("不截断审核参数后放行", () => assert.equal(localDecision(request("x".repeat(25000)), DEFAULT_CONFIG, tmpdir())?.decision, "deny"));
+test("磁盘破坏直接拒绝", () => assert.equal(localDecision(request("mkfs /dev/example"), DEFAULT_CONFIG)?.decision, "deny"));
+test("不截断审核参数后放行", () => assert.equal(localDecision(request("x".repeat(25000)), DEFAULT_CONFIG)?.decision, "deny"));
 test("配置严格校验", () => { assert.throws(() => parseConfig({ timeoutMs: 0 })); assert.throws(() => parseConfig({ enabled: false })); assert.throws(() => parseConfig(JSON.parse('{"__proto__":{}}'))); });
-test("控制字符不能在脱敏后伪装成安全命令", () => assert.equal(localDecision(request("p\u001bwd"), DEFAULT_CONFIG, tmpdir())?.decision, "deny"));
+test("控制字符不能在脱敏后伪装成安全命令", () => assert.equal(localDecision(request("p\u001bwd"), DEFAULT_CONFIG)?.decision, "deny"));
 test("模型必须返回完整严格 JSON", () => {
   for (const text of ["allow", '```json\n{"decision":"allow","reason":"可读"}\n```', '{"decision":"allow"}', '{"decision":"allow","reason":"可读","other":true}']) assert.throws(() => parseVerdict(text));
 });
@@ -29,9 +29,47 @@ test("字段和命令中的常见敏感格式脱敏", () => {
   const data = JSON.stringify(redact({ token: "fictional", text: `phone=${phone} password=fictional` }));
   assert.ok(!data.includes(phone)); assert.ok(!data.includes("fictional"));
 });
-test("全局配置不能由 AI 直接修改", () => {
-  const r = { ...request(""), tool: "write", args: { path: join(tmpdir(), "settings.json"), content: "{}" } };
-  assert.equal(localDecision(r, DEFAULT_CONFIG, tmpdir())?.decision, "deny");
+for (const tool of ["write", "edit"]) {
+  for (const path of ["settings.json", "AGENTS.md", "skills/demo/SKILL.md", "extensions/pi-command-audit/policy.ts", "npm/node_modules/demo/index.js"]) {
+    test(`全局 ${tool} ${path} 进入模型审核`, async () => {
+      const f = fixture();
+      try {
+        const args = { path: join(f.dir, path), ...(tool === "write" ? { content: "普通维护内容" } : { edits: [{ oldText: "旧内容", newText: "新内容" }] }) };
+        assert.equal(localDecision({ kind: "tool", tool, args, cwd: f.dir }, DEFAULT_CONFIG), undefined);
+        assert.equal(await f.invoke(tool, args), undefined);
+        assert.equal(f.calls.length, 1);
+        const payload = JSON.parse((f.calls[0] as any)[1].messages[0].content[0].text);
+        assert.equal(payload.args.path, args.path);
+      } finally { await f.dispose(); }
+    });
+  }
+}
+test("全局凭据文件仍保留独立的直接拒绝规则", async () => {
+  const f = fixture();
+  try {
+    for (const tool of ["write", "edit"]) {
+      assert.equal((await f.invoke(tool, { path: join(f.dir, "auth.json"), content: "虚拟内容" })).block, true);
+    }
+    assert.equal(f.calls.length, 0);
+  } finally { await f.dispose(); }
+});
+for (const decision of ["ask", "deny"]) {
+  test(`全局文件修改服从模型 ${decision} 结果`, async () => {
+    const f = fixture({ ui: true, confirm: false, answer: JSON.stringify({ decision, reason: "测试模型风险判断" }) });
+    try {
+      const result = await f.invoke("write", { path: join(f.dir, "AGENTS.md"), content: "测试内容" });
+      assert.equal(result.block, true);
+      assert.equal(f.calls.length, 1);
+      assert.match(result.reason, decision === "ask" ? /用户已拒绝/ : /测试模型风险判断/);
+    } finally { await f.dispose(); }
+  });
+}
+test("全局文件修改在模型 ask 且人工同意后放行", async () => {
+  const f = fixture({ ui: true, confirm: true, answer: '{"decision":"ask","reason":"执行行为变更需确认"}' });
+  try {
+    assert.equal(await f.invoke("edit", { path: join(f.dir, "extensions/demo/index.ts"), edits: [{ oldText: "旧", newText: "新" }] }), undefined);
+    assert.equal(f.calls.length, 1);
+  } finally { await f.dispose(); }
 });
 
 function fixture(options: { ui?: boolean; answer?: string; confirm?: boolean; complete?: () => Promise<unknown> } = {}) {

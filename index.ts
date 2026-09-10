@@ -62,7 +62,7 @@ export default function commandAudit(pi: ExtensionAPI) {
       const bridge = verifySubagentBridge();
       if (!bridge.ok) return { decision: "deny", reason: bridge.reason };
     }
-    const local = localDecision(r, config, agentDir);
+    const local = localDecision(r, config);
     if (local) return local;
     if (r.kind === "tool" && r.tool === "subagent" &&
         (r.args.workflowScript !== undefined || r.args.workflowScriptPath !== undefined || r.args.workflow !== undefined)) {
