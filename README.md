@@ -22,7 +22,7 @@ node ~/.pi/agent/extensions/pi-command-audit/compat/install.mjs
 
 1. 在 Pi `tool_call` 事件执行前审核工具完整参数。
 2. 精确匹配的少量低风险命令直接通过；已知磁盘破坏及部分凭据访问直接拒绝；删除、提权等风险操作请求人工确认。
-3. 其它操作使用 `ctx.modelRegistry.complete()` 单独调用审核模型，没有工具权限，不递归调用 subagent，也不发送完整会话历史。
+3. 其它操作使用 `ctx.modelRegistry.complete()` 单独调用审核模型，没有工具权限，不递归调用 subagent。附带当前分支最近用户目标、其后的助手说明以及精确匹配的工具注册元数据，不发送完整会话或工具返回正文。
 4. 模型严格返回 `allow / ask / deny`。格式错误、异常、取消、超时、配置错误、日志写入失败均不执行。
 5. `ask` 在有 UI 的会话中逐次确认；关闭弹窗、超时或无 UI 均不放行。没有自动转交父代理批准的机制。
 
@@ -37,6 +37,55 @@ node ~/.pi/agent/extensions/pi-command-audit/compat/install.mjs
 ```
 
 `test` 只审核文本，不执行命令，也不弹出执行批准对话框。
+
+## WezTerm 桌面审批提醒
+
+需要人工审批时，在 Pi 原生选择器之外，通过 OSC 777 发送桌面 Toast，通过 OSC 1337 设置当前 pane 的待审批状态。只在 `ctx.mode=tui`、stdout 是 TTY 且检测到 WezTerm pane 时启用；RPC、后台子会话不向输出写控制序列。
+
+默认 Toast 仅包含项目目录名、pane 编号与固定提醒，不暴露完整命令、模型理由或业务内容。通知是提醒，不是批准入口；本阶段需要返回 Pi 选择“拒绝本次 / 允许本次”，不支持桌面通知按钮批准、不抢焦点，也不承诺点击通知定位到具体标签页。Windows 通知权限及勿扰模式可能阻止实际弹出，发送成功不等于用户看到了通知。
+
+安装标签标记：先检查已有 WezTerm 配置中的 `format-tab-title` 事件（只执行首个该事件），再将 `integrations/wezterm.lua` 显式加载。示例：
+
+```lua
+local ok, audit = pcall(dofile, wezterm.home_dir .. '/.pi/agent/extensions/pi-command-audit/integrations/wezterm.lua')
+if ok then audit.setup() end
+```
+
+有待审批 pane 的标签显示 `[审批 N]`，颜色使用原主题，正常标题保持不变。N 为该标签中待审批的 pane 数，不是工具排队长度；普通审批仍串行展示。结束时清除状态，进程崩溃后按请求过期时间在下一次标签重绘时忽略旧状态。系统通知历史不能通过 OSC 撤回，不表示请求仍有效。
+
+执行 `/reload` 后可手动测试（不运行任何业务命令）：
+
+```text
+/command-audit notify-test
+```
+
+运行后切到其它应用检查桌面提醒，再返回 Pi 决定。此命令测试真实终端通道，不自动保证系统通知已展示。关闭提醒可设置 `weztermNotifications: false`。
+
+### Windows / Scoop 安装后没有桌面通知
+
+标签变化只证明 OSC pane 状态到达 WezTerm，不代表 Windows 接受桌面通知。先检查系统通知总开关、勿扰模式及 WezTerm 通知权限。WezTerm `20240203-110809-5046fc22` 默认 `notification_handling = "AlwaysShow"`，不要直接把问题归因于默认焦点抑制。
+
+便携版或 Scoop 安装可能缺少官方通知身份 `org.wezfurlong.wezterm` 的开始菜单快捷方式。上游 Windows 安装器会给快捷方式设置该 AppUserModelID，Toast 后端也使用相同 ID；普通可执行程序快捷方式未必带此属性。
+
+可在 PowerShell 7 中运行以下一次性修复（按实际路径传入 exe）：
+
+```powershell
+& "$HOME/.pi/agent/extensions/pi-command-audit/integrations/register-wezterm-notifications.ps1" -Executable "<wezterm-gui.exe绝对路径>" -TestNotification
+```
+
+脚本只在当前用户开始菜单中创建独立的 `WezTerm Pi Notifications.lnk`，写入官方同名通知身份并读回验证，不修改原快捷方式、系统通知权限、焦点或审批授权。已有同名快捷方式会先备份。`-TestNotification` 发送固定的无业务内容测试通知；Windows API 成功不保证横幅出现，仍需用户观察桌面或通知中心。
+
+Windows PowerShell 5.1 如无法正确读取 UTF-8 中文，可先用 `[IO.File]::ReadAllText()` 读取脚本，再以 scriptblock 执行；不需要更改系统执行策略。回滚时删除该独立快捷方式；如存在脚本生成的旧快捷方式备份，可恢复备份。
+
+## 模型理解增强
+
+- 最近用户目标最多 3000 字符，助手目的最多 1200 字符，截断有显式标识；不发送思考块、图片或历史工具正文。
+- 只有当前分支用户消息与已观察 input 原文一致才标注其 interactive/rpc/extension 来源，否则标记为 `origin-unverified`。这些上下文都不是人工审批凭据。
+- 工具元数据来自 Pi 注册表的精确工具名匹配。MCP 优先使用 prefixedToolName；无元数据、缺失脚本内容或 CLI 帮助时明确告知审核者，不能假装已查阅。
+- 模型输出新增操作 `summary`、`uncertainties`，同时兼容旧的 decision/reason 两字段；人工界面展示摘要、理由及缺失依据。
+- 明确区分正常使用登录态与导出凭据、目标服务只读获取与向第三方上传、本地脱敏与数据外传。仍检查内联代码的实际行为，不只按命令名放行。
+- 所有材料均属不可信语义线索，工具描述和助手声明不能修改审核规则。
+- 目前不自动执行 CLI 帮助或读取脚本补证，不新增 CLI 通配白名单；本地危险规则保持原状。
 
 ## 后续 Subagent 升级技能
 
@@ -71,22 +120,24 @@ node ~/.pi/agent/extensions/pi-command-audit/compat/install.mjs
 {
   "model": "current",
   "timeoutMs": 30000,
-  "confirmTimeoutMs": 60000,
+  "confirmTimeoutMs": 300000,
   "maxInputChars": 24000,
-  "mcpAllow": []
+  "mcpAllow": [],
+  "weztermNotifications": true
 }
 ```
 
 - `model: "current"`：使用当前会话模型和 Pi 已配置的认证。每个子会话使用自己的当前模型。
 - 可固定审核模型：`"model": {"provider":"你的 provider", "id":"你的模型 ID"}`，支持模型 ID 内含 `/`。不需要复制 API Key。
-- `timeoutMs`：模型审核超时；`confirmTimeoutMs`：人工确认超时，单位毫秒。
+- `timeoutMs`：模型审核超时；`confirmTimeoutMs`：人工确认超时，默认 5 分钟，单位毫秒。现有配置中的显式值优先；子任务/工具的宿主截止时间仍生效，取消信号会中止审批，不会延长任务期限。
+- `weztermNotifications`：是否发送 WezTerm 桌面提醒和 pane 状态，默认 true。通知不提供自动授权。
 - `maxInputChars`：参数及脱敏后的审核请求上限。超限直接拒绝，不截断后放行。
 - `mcpAllow`：精确匹配服务器名和原始工具名，例如 `[{"server":"idea","tool":"get_file_problems"}]`。只有确认该工具所有允许参数都符合预期时再添加；名称像只读不代表安全。
 - 配置修改后执行 `/reload`。已有后台子会话持有自己的配置快照，需要结束后重新启动才会使用新配置。
 
 默认只有 `pwd`、`git status`（可带 `--short` 或 `--porcelain`）、`git diff --stat` 等整个命令精确匹配时免模型审核。复合命令、重定向、脚本不会因相同前缀直接通过。工作区环境、PATH、Git 配置仍属于用户信任边界。
 
-模型审核增加延迟和 token 成本。审核是独立的 provider 请求，不计入普通工具返回的 usage；以 provider 账单为准。请求包含脱敏后的工具参数和工作目录，不包含完整会话或凭据文件内容。常见手机号、身份证格式和令牌字段会脱敏，但脱敏并不完备；不要发送不允许交给所选 provider 的数据。
+模型审核增加延迟和 token 成本。审核是独立的 provider 请求，不计入普通工具返回的 usage；以 provider 账单为准。请求包含脱敏后的工具参数、工作目录和上述有限审核上下文，不包含完整会话或额外读取的凭据文件内容。常见手机号、身份证格式和令牌字段会脱敏，但脱敏并不完备；不要发送不允许交给所选 provider 的数据。
 
 ## MCP 支持
 
@@ -163,7 +214,7 @@ node ~/.pi/agent/extensions/pi-command-audit/compat/install.mjs
 - 用户手动输入的 `!` / `!!` 命令不审核，便于用户维护配置。
 - AI `write/edit` 修改 Pi 全局目录不再因目录位置直接拒绝。全局 Skill、AGENTS.md、插件源码、配置和 npm 依赖文件继续交给模型按修改内容审核：`allow` 放行，`ask` 人工确认，`deny` 阻止。影响执行行为、权限或审核机制的维护变更要求模型返回 `ask`；明显恶意的审核绕过仍可拒绝。常见凭据文件（如 auth.json、.env）的独立拒绝规则及参数长度上限保持不变。这不是完整的自修改防御。
 - 已加载的可信扩展使用 `pi.exec`、Node 文件 API 或进程 API 的内部操作不一定触发工具事件。其它后置事件处理器也可改变参数。插件不能防御同进程的恶意扩展。
-- 日志只记录时间、会话 ID、类型、请求 SHA-256、初审决定、最终结果分类和是否放行，不记录原始参数、路径、工具名、理由或对话。位置为 `~/.pi/agent/command-audit-logs/YYYY-MM-DD-PID.jsonl`。日志没有自动清理，按需由用户清理；Windows 权限取决于父目录 ACL。
+- 日志只记录时间、会话 ID、类型、请求 SHA-256、初审决定、决策来源（local/model/guard）、最终结果分类和是否放行，不记录原始参数、路径、工具名、理由或对话。位置为 `~/.pi/agent/command-audit-logs/YYYY-MM-DD-PID.jsonl`。日志没有自动清理，按需由用户清理；Windows 权限取决于父目录 ACL。
 
 ## 验证
 

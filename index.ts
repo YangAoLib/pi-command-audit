@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { createHash, randomUUID } from "node:crypto";
 import { verifySubagentBridge } from "./subagent-bridge.ts";
+import { buildReviewContext, type ObservedInput } from "./review-context.ts";
 import { startApprovalBroker, type ApprovalBroker } from "./external-approval.ts";
 import { approvalReason, countOutcome, formatAuditStatus, notifyBlocked, requestApproval, type AuditOutcome } from "./approval-ui.ts";
 import {
@@ -34,6 +35,7 @@ export default function commandAudit(pi: ExtensionAPI) {
   let confirmationQueue: Promise<unknown> = Promise.resolve();
   let counters = { allowed: 0, denied: 0, cancelled: 0 };
   let approvalBroker: ApprovalBroker | undefined;
+  let observedInput: ObservedInput | undefined;
 
   function loadConfig() {
     configError = false;
@@ -51,11 +53,11 @@ export default function commandAudit(pi: ExtensionAPI) {
     appendFileSync(join(dir, `${new Date().toISOString().slice(0, 10)}-${process.pid}.jsonl`), JSON.stringify({
       time: new Date().toISOString(), sessionId: ctx.sessionManager.getSessionId(),
       kind: r.kind, requestHash: createHash("sha256").update(JSON.stringify(r)).digest("hex"),
-      decision: result.decision, allowed, outcome,
+      decision: result.decision, allowed, outcome, source: result.source ?? "guard",
     }) + "\n", { mode: 0o600 });
   }
 
-  async function classify(r: AuditRequest, ctx: ExtensionContext, signal: AbortSignal): Promise<Decision> {
+  async function classify(r: AuditRequest, ctx: ExtensionContext, signal: AbortSignal, registeredName?: string): Promise<Decision> {
     signal.throwIfAborted();
     if (configError) return { decision: "deny", reason: "全局审核配置无效，请用户修复后 /reload" };
     if (r.kind === "tool" && r.tool === "subagent" && !["list", "status", "guide"].includes(String(r.args.action))) {
@@ -63,14 +65,17 @@ export default function commandAudit(pi: ExtensionAPI) {
       if (!bridge.ok) return { decision: "deny", reason: bridge.reason };
     }
     const local = localDecision(r, config);
-    if (local) return local;
+    if (local) return { ...local, source: "local" };
     if (r.kind === "tool" && r.tool === "subagent" &&
         (r.args.workflowScript !== undefined || r.args.workflowScriptPath !== undefined || r.args.workflow !== undefined)) {
       return { decision: "ask", reason: "子代理内部命令会分别审核；工作流还可能包含 runs.host 等主机操作，需要核对完整工作流" };
     }
     const model = config.model === "current" ? ctx.model : ctx.modelRegistry.find(config.model.provider, config.model.id);
     if (!model) return { decision: "deny", reason: "审核模型不可用" };
-    const payload = JSON.stringify(redact(r));
+    let tools: ReturnType<ExtensionAPI["getAllTools"]> = [];
+    try { tools = pi.getAllTools(); } catch { /* 无元数据时明确保留缺失，不阻断模型判断。 */ }
+    const reviewContext = buildReviewContext(ctx, tools, r, observedInput, registeredName);
+    const payload = JSON.stringify(redact({ ...r, reviewContext }));
     if (payload.length > config.maxInputChars) return { decision: "deny", reason: "审核上下文过长，请拆分操作" };
     const response = await ctx.modelRegistry.complete(model, {
       systemPrompt: REVIEW_PROMPT,
@@ -78,10 +83,10 @@ export default function commandAudit(pi: ExtensionAPI) {
     }, { signal, maxTokens: 1024, cacheRetention: "none", sessionId: randomUUID() });
     signal.throwIfAborted();
     if (response.stopReason !== "stop" || response.content.some(c => c.type === "toolCall")) throw new Error("审核未正常结束");
-    return parseVerdict(response.content.filter(c => c.type === "text").map(c => c.text).join("\n"));
+    return { ...parseVerdict(response.content.filter(c => c.type === "text").map(c => c.text).join("\n")), source: "model" };
   }
 
-  async function review(r: AuditRequest, ctx: ExtensionContext, extraSignal?: AbortSignal, dryRun = false): Promise<Decision & { allowed: boolean }> {
+  async function review(r: AuditRequest, ctx: ExtensionContext, extraSignal?: AbortSignal, dryRun = false, registeredName?: string): Promise<Decision & { allowed: boolean }> {
     const active = AbortSignal.any([lifetime.signal, ...[ctx.signal, extraSignal].filter((s): s is AbortSignal => !!s)]);
     const timeout = new AbortController();
     const timer = setTimeout(() => timeout.abort(), config.timeoutMs);
@@ -93,7 +98,7 @@ export default function commandAudit(pi: ExtensionAPI) {
         const abort = () => reject(new Error("审核取消或超时"));
         modelSignal.addEventListener("abort", abort, { once: true });
         if (modelSignal.aborted) { abort(); return; }
-        classify(r, ctx, modelSignal).then(resolve, reject).finally(() => modelSignal.removeEventListener("abort", abort));
+        classify(r, ctx, modelSignal, registeredName).then(resolve, reject).finally(() => modelSignal.removeEventListener("abort", abort));
       });
     } catch {
       result = { decision: "deny", reason: "审核失败、超时、取消或返回格式无效，已阻止执行" };
@@ -103,7 +108,7 @@ export default function commandAudit(pi: ExtensionAPI) {
     let finalReason = result.reason;
     if (!dryRun && result.decision === "ask") {
       const confirm = confirmationQueue.then(() => requestApproval(ctx, "命令审核 · 请确认本次操作",
-        `${result.reason}\n\n${JSON.stringify(redact(r), null, 2)}`, active, config.confirmTimeoutMs));
+        `${result.summary ? `操作：${result.summary}\n` : ""}原因：${result.reason}${result.uncertainties?.length ? `\n待确认：${result.uncertainties.join("；")}` : ""}\n\n${JSON.stringify(redact(r), null, 2)}`, active, config.confirmTimeoutMs, { enabled: config.weztermNotifications }));
       confirmationQueue = confirm.catch(() => undefined);
       outcome = await confirm;
       allowed = outcome === "approved" && !active.aborted;
@@ -127,9 +132,12 @@ export default function commandAudit(pi: ExtensionAPI) {
     skillPaths: [fileURLToPath(new URL("./skills/command-audit-subagent-upgrade/SKILL.md", import.meta.url))],
   }));
 
+  pi.on("input", event => { observedInput = { text: event.text, source: event.source }; });
+  pi.on("session_tree", () => { observedInput = undefined; });
   loadConfig();
   pi.on("session_start", async (_event, ctx) => {
     ctxCurrent = ctx;
+    observedInput = undefined;
     lifetime.abort();
     lifetime = new AbortController();
     counters = { allowed: 0, denied: 0, cancelled: 0 };
@@ -142,7 +150,7 @@ export default function commandAudit(pi: ExtensionAPI) {
           const active = AbortSignal.any([lifetime.signal, signal]);
           const pending = confirmationQueue.then(() => requestApproval(ctx, "外部 runner · 是否允许本次启动？",
             "此确认仅允许本次外部启动。其内部命令不经过 Pi 逐条审核，请依赖该 CLI/provider 自身的权限与沙箱。\n\n" + preview,
-            active, config.confirmTimeoutMs));
+            active, config.confirmTimeoutMs, { enabled: config.weztermNotifications }));
           confirmationQueue = pending.catch(() => undefined);
           const outcome = await pending;
           const allowed = outcome === "approved" && !active.aborted;
@@ -186,20 +194,26 @@ export default function commandAudit(pi: ExtensionAPI) {
       const ctx = ctxCurrent;
       if (!ctx || lifetime.signal.aborted) return "deny";
       const result = await review({ kind: "mcp", tool: request.originalToolName,
-        server: request.serverName, origin: request.origin, args: request.args ?? {}, cwd: ctx.cwd }, ctx, request.signal);
+        server: request.serverName, origin: request.origin, args: request.args ?? {}, cwd: ctx.cwd }, ctx, request.signal, false, request.prefixedToolName);
       return result.allowed ? "allow_once" : "deny";
     });
   });
 
   pi.registerCommand("command-audit", {
-    description: "查看命令审核状态；test <命令> 只审核而不执行",
+    description: "查看审核状态；test <命令> 只审核；notify-test 测试 WezTerm 桌面审批提醒",
     handler: async (args, ctx) => {
-      if (args.startsWith("test ")) {
-        const result = await review({ kind: "tool", tool: "bash", args: { command: args.slice(5) }, cwd: ctx.cwd }, ctx, undefined, true);
-        ctx.ui.notify(`${result.decision}：${result.reason}（未执行）`, result.decision === "allow" ? "info" : "warning");
+      if (args === "notify-test") {
+        const outcome = await requestApproval(ctx, "WezTerm 审批提醒测试", "这是通知与选择器测试，不执行任何命令。请切到其它窗口查看桌面通知，再返回此标签选择。",
+          lifetime.signal, config.confirmTimeoutMs, { enabled: config.weztermNotifications, summary: "这是 Pi 审批提醒测试，不执行命令。请返回带 [审批] 标记的标签页处理。" });
+        ctx.ui.notify(`通知测试：${approvalReason(outcome)}（没有执行命令）`, "info");
         return;
       }
-      ctx.ui.notify(`命令审核：${configError ? "配置错误，默认拒绝" : "已启用"}\n模型：${config.model === "current" ? "跟随当前会话" : config.model.provider + "/" + config.model.id}\n配置：${configPath}\nMCP：逐调用审批；Subagent：${verifySubagentBridge().reason}\n不拦截用户手输的 !/!!，不构成操作系统沙箱。`, "info");
+      if (args.startsWith("test ")) {
+        const result = await review({ kind: "tool", tool: "bash", args: { command: args.slice(5) }, cwd: ctx.cwd }, ctx, undefined, true);
+        ctx.ui.notify(`${result.decision}：${result.summary ? result.summary + "；" : ""}${result.reason}（未执行）`, result.decision === "allow" ? "info" : "warning");
+        return;
+      }
+      ctx.ui.notify(`命令审核：${configError ? "配置错误，默认拒绝" : "已启用"}\n模型：${config.model === "current" ? "跟随当前会话" : config.model.provider + "/" + config.model.id}\n配置：${configPath}\n人工确认期限：${config.confirmTimeoutMs / 1000} 秒；WezTerm 提醒：${config.weztermNotifications ? "开启（需 TUI + WezTerm）" : "关闭"}\nMCP：逐调用审批；Subagent：${verifySubagentBridge().reason}\n不拦截用户手输的 !/!!，不构成操作系统沙箱。`, "info");
     },
   });
 }

@@ -1,4 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { beginWeztermApproval, type NotificationOptions } from "./wezterm-notify.ts";
 
 export type ApprovalOutcome = "approved" | "user_denied" | "cancelled" | "timeout" | "headless" | "error";
 export type AuditOutcome = ApprovalOutcome | "allowed" | "denied";
@@ -38,6 +39,7 @@ export function notifyBlocked(ctx: ExtensionContext, tool: string, reason: strin
 
 export async function requestApproval(
   ctx: ExtensionContext, title: string, message: string, signal: AbortSignal, timeoutMs: number,
+  notification: NotificationOptions = { enabled: true },
 ): Promise<ApprovalOutcome> {
   if (signal.aborted) return "cancelled";
   if (!ctx.hasUI) return "headless";
@@ -46,6 +48,7 @@ export async function requestApproval(
   const timer = setTimeout(() => timeout.abort(), timeoutMs);
   const combined = AbortSignal.any([signal, timeout.signal]);
   let onAbort: (() => void) | undefined;
+  const endNotification = beginWeztermApproval(ctx, deadline, notification);
   try {
     // confirm() 将 No、Esc、超时都压成 false；原生 select() 能保留明确拒绝。
     // 默认选中拒绝，避免误按回车批准。沿用 Pi 自身的选择器和主题。
@@ -68,6 +71,7 @@ export async function requestApproval(
     return "error";
   } finally {
     clearTimeout(timer);
+    endNotification();
     if (onAbort) combined.removeEventListener("abort", onAbort);
   }
 }
