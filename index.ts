@@ -6,10 +6,11 @@ import { fileURLToPath } from "node:url";
 import { createHash, randomUUID } from "node:crypto";
 import { verifySubagentBridge } from "./subagent-bridge.ts";
 import { buildReviewContext, type ObservedInput } from "./review-context.ts";
-import { startApprovalBroker, type ApprovalBroker } from "./external-approval.ts";
+import { dataRoot } from "./data-paths.ts";
+import { startApprovalBroker, requestParentApproval, ParentApprovalError, type ApprovalBroker } from "./external-approval.ts";
 import { approvalReason, countOutcome, formatAuditStatus, notifyBlocked, requestApproval, type AuditOutcome } from "./approval-ui.ts";
 import {
-  DEFAULT_CONFIG, REVIEW_PROMPT, localDecision, parseConfig, parseVerdict, redact, redactText,
+  DEFAULT_CONFIG, REVIEW_PROMPT, localDecision, parseConfig, parseModelReference, parseVerdict, redact, redactText,
   type AuditRequest, type Config, type Decision,
 } from "./policy.ts";
 
@@ -47,7 +48,7 @@ export default function commandAudit(pi: ExtensionAPI) {
   }
 
   function auditLog(r: AuditRequest, ctx: ExtensionContext, result: Decision, allowed: boolean, outcome: AuditOutcome) {
-    const dir = join(agentDir, "command-audit-logs");
+    const dir = join(dataRoot, "logs");
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     // 不保存命令、路径、参数、模型理由或用户对话，避免日志二次泄漏。
     appendFileSync(join(dir, `${new Date().toISOString().slice(0, 10)}-${process.pid}.jsonl`), JSON.stringify({
@@ -70,7 +71,8 @@ export default function commandAudit(pi: ExtensionAPI) {
         (r.args.workflowScript !== undefined || r.args.workflowScriptPath !== undefined || r.args.workflow !== undefined)) {
       return { decision: "ask", reason: "子代理内部命令会分别审核；工作流还可能包含 runs.host 等主机操作，需要核对完整工作流" };
     }
-    const model = config.model === "current" ? ctx.model : ctx.modelRegistry.find(config.model.provider, config.model.id);
+    const reference = parseModelReference(config.model);
+    const model = reference ? ctx.modelRegistry.find(reference.provider, reference.id) : ctx.model;
     if (!model) return { decision: "deny", reason: "审核模型不可用" };
     let tools: ReturnType<ExtensionAPI["getAllTools"]> = [];
     try { tools = pi.getAllTools(); } catch { /* 无元数据时明确保留缺失，不阻断模型判断。 */ }
@@ -107,8 +109,18 @@ export default function commandAudit(pi: ExtensionAPI) {
     let outcome: AuditOutcome = active.aborted ? "cancelled" : allowed ? "allowed" : "denied";
     let finalReason = result.reason;
     if (!dryRun && result.decision === "ask") {
-      const confirm = confirmationQueue.then(() => requestApproval(ctx, "命令审核 · 请确认本次操作",
-        `${result.summary ? `操作：${result.summary}\n` : ""}原因：${result.reason}${result.uncertainties?.length ? `\n待确认：${result.uncertainties.join("；")}` : ""}\n\n${JSON.stringify(redact(r), null, 2)}`, active, config.confirmTimeoutMs, { enabled: config.weztermNotifications }));
+      const confirm = confirmationQueue.then(async () => {
+        const message = `${result.summary ? `操作：${result.summary}\n` : ""}原因：${result.reason}${result.uncertainties?.length ? `\n待确认：${result.uncertainties.join("；")}` : ""}\n\n${JSON.stringify(redact(r), null, 2)}`;
+        if (!ctx.hasUI) {
+          try {
+            await requestParentApproval(message, "tool", active, Date.now() + config.confirmTimeoutMs);
+            return "approved" as const;
+          } catch (error) { return active.aborted ? "cancelled" as const : error instanceof ParentApprovalError ? error.outcome : "headless" as const; }
+        }
+        return requestApproval(ctx, "命令审核 · 请确认本次操作", message, active, config.confirmTimeoutMs, {
+          enabled: config.weztermNotifications, summary: `${result.summary ?? `工具 ${r.tool} 请求执行`}；${result.reason}`,
+          operationHash: createHash("sha256").update(JSON.stringify(r)).digest("hex") });
+      });
       confirmationQueue = confirm.catch(() => undefined);
       outcome = await confirm;
       allowed = outcome === "approved" && !active.aborted;
@@ -146,18 +158,21 @@ export default function commandAudit(pi: ExtensionAPI) {
     approvalBroker = undefined;
     if (ctx.hasUI && !configError) {
       try {
-        approvalBroker = await startApprovalBroker(async (preview, signal) => {
+        approvalBroker = await startApprovalBroker(async (preview, signal, kind) => {
           const active = AbortSignal.any([lifetime.signal, signal]);
-          const pending = confirmationQueue.then(() => requestApproval(ctx, "外部 runner · 是否允许本次启动？",
-            "此确认仅允许本次外部启动。其内部命令不经过 Pi 逐条审核，请依赖该 CLI/provider 自身的权限与沙箱。\n\n" + preview,
-            active, config.confirmTimeoutMs, { enabled: config.weztermNotifications }));
+          const pending = confirmationQueue.then(() => requestApproval(ctx,
+            kind === "tool" ? "子代理工具 · 是否允许本次操作？" : "外部 runner · 是否允许本次启动？",
+            (kind === "tool" ? "子代理请求人工审批。请核对以下完整操作；父 AI 不能代替你批准。\n\n" : "此确认仅允许本次外部启动。其内部命令不经过 Pi 逐条审核，请依赖该 CLI/provider 自身的权限与沙箱。\n\n") + preview,
+            active, config.confirmTimeoutMs, { enabled: config.weztermNotifications,
+              summary: kind === "tool" ? "子代理工具请求人工审批，请返回终端查看完整参数。" : "启动外部 runner，内部命令不受 Pi 逐条审核；允许仅作用于本次启动。",
+              operationHash: createHash("sha256").update(preview).digest("hex") }));
           confirmationQueue = pending.catch(() => undefined);
           const outcome = await pending;
           const allowed = outcome === "approved" && !active.aborted;
           countOutcome(counters, allowed, outcome);
           ctx.ui.setStatus("command-audit", formatAuditStatus(ctx, counters));
-          if (!allowed) notifyBlocked(ctx, "外部 runner", approvalReason(outcome), outcome);
-          return allowed;
+          if (!allowed) notifyBlocked(ctx, kind === "tool" ? "子代理工具" : "外部 runner", approvalReason(outcome), outcome);
+          return active.aborted ? "cancelled" : outcome;
         }, config.confirmTimeoutMs);
       } catch { ctx.ui.notify("外部 runner 人工确认服务启动失败，将阻止外部启动", "warning"); }
     }
@@ -181,8 +196,10 @@ export default function commandAudit(pi: ExtensionAPI) {
       const input = event.input as Record<string, unknown>;
       if (!input.action || input.action === "ui-messages") return;
     }
+    const original = JSON.stringify(event.input);
     const result = await review({ kind: "tool", tool: event.toolName,
       args: event.input as Record<string, unknown>, cwd: ctx.cwd }, ctx);
+    if (original !== JSON.stringify(event.input)) return { block: true, reason: "审批期间参数已改变，请重新审核", terminate: true };
     if (!result.allowed) return { block: true, reason: `命令审核阻止：${result.reason}`, terminate: true };
   });
 
@@ -193,9 +210,10 @@ export default function commandAudit(pi: ExtensionAPI) {
     request.claim(async () => {
       const ctx = ctxCurrent;
       if (!ctx || lifetime.signal.aborted) return "deny";
+      const original = JSON.stringify(request.args);
       const result = await review({ kind: "mcp", tool: request.originalToolName,
         server: request.serverName, origin: request.origin, args: request.args ?? {}, cwd: ctx.cwd }, ctx, request.signal, false, request.prefixedToolName);
-      return result.allowed ? "allow_once" : "deny";
+      return result.allowed && original === JSON.stringify(request.args) ? "allow_once" : "deny";
     });
   });
 
@@ -203,8 +221,8 @@ export default function commandAudit(pi: ExtensionAPI) {
     description: "查看审核状态；test <命令> 只审核；notify-test 测试 WezTerm 桌面审批提醒",
     handler: async (args, ctx) => {
       if (args === "notify-test") {
-        const outcome = await requestApproval(ctx, "WezTerm 审批提醒测试", "这是通知与选择器测试，不执行任何命令。请切到其它窗口查看桌面通知，再返回此标签选择。",
-          lifetime.signal, config.confirmTimeoutMs, { enabled: config.weztermNotifications, summary: "这是 Pi 审批提醒测试，不执行命令。请返回带 [审批] 标记的标签页处理。" });
+        const outcome = await requestApproval(ctx, "WezTerm 审批提醒测试", "这是桌面按钮与终端同步测试，不执行任何命令。可在桌面通知或当前终端选择；先完成的一端生效。",
+          lifetime.signal, config.confirmTimeoutMs, { enabled: config.weztermNotifications, summary: "这是桌面按钮测试，不执行任何命令。允许/拒绝应关闭终端审批；返回终端不代表批准。" });
         ctx.ui.notify(`通知测试：${approvalReason(outcome)}（没有执行命令）`, "info");
         return;
       }
@@ -213,7 +231,7 @@ export default function commandAudit(pi: ExtensionAPI) {
         ctx.ui.notify(`${result.decision}：${result.summary ? result.summary + "；" : ""}${result.reason}（未执行）`, result.decision === "allow" ? "info" : "warning");
         return;
       }
-      ctx.ui.notify(`命令审核：${configError ? "配置错误，默认拒绝" : "已启用"}\n模型：${config.model === "current" ? "跟随当前会话" : config.model.provider + "/" + config.model.id}\n配置：${configPath}\n人工确认期限：${config.confirmTimeoutMs / 1000} 秒；WezTerm 提醒：${config.weztermNotifications ? "开启（需 TUI + WezTerm）" : "关闭"}\nMCP：逐调用审批；Subagent：${verifySubagentBridge().reason}\n不拦截用户手输的 !/!!，不构成操作系统沙箱。`, "info");
+      ctx.ui.notify(`命令审核：${configError ? "配置错误，默认拒绝" : "已启用"}\n模型：${config.model === "current" ? "跟随当前会话" : config.model}\n配置：${configPath}\n人工确认期限：${config.confirmTimeoutMs / 1000} 秒；WezTerm 提醒：${config.weztermNotifications ? "开启（需 TUI + WezTerm）" : "关闭"}\nMCP：逐调用审批；Subagent：${verifySubagentBridge().reason}\n不拦截用户手输的 !/!!，不构成操作系统沙箱。`, "info");
     },
   });
 }

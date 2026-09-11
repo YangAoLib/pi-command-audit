@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 
 const root = dirname(fileURLToPath(import.meta.url));
 const entry = join(root, "index.ts");
-const receiptPath = join(root, "compat", "installed.json");
+const receiptPath = join(root, "data", "compat", "installed.json");
 import { confirmExternalRunner as requestExternalApproval, type ExternalLaunch } from "./external-approval.ts";
 
 export async function confirmExternalRunner(input: ExternalLaunch): Promise<void> {

@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 
 const own = dirname(fileURLToPath(import.meta.url));
+const storage = join(own, "../data/compat");
 const packageRoot = join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "npm/node_modules/pi-subagents");
 const pkg = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
 const verifiedHashes = {
@@ -55,7 +56,7 @@ const specs = [
   },
 ];
 const hash = bytes => createHash("sha256").update(bytes).digest("hex");
-const receiptFile = join(own, "installed.json");
+const receiptFile = join(storage, "installed.json");
 if (existsSync(receiptFile)) {
   const receipt = JSON.parse(readFileSync(receiptFile, "utf8"));
   if (receipt.version === 2 && receipt.packageVersion === pkg.version && receipt.packageRoot === packageRoot && specs.every(s => {
@@ -82,7 +83,7 @@ const changes = specs.map((s, index) => {
   after = `// pi-command-audit 兼容补丁 v2：由用户安装，不属于上游发布内容。\nimport { ${s.imports} } from ${JSON.stringify(modulePath)};\n` + after;
   return { path, fullPath, before, after, installedHash: hash(after) };
 });
-const backupDir = join(own, "originals", pkg.version);
+const backupDir = join(storage, "originals", pkg.version);
 mkdirSync(backupDir, { recursive: true });
 for (const c of changes) {
   const backup = join(backupDir, c.path.split("/").at(-1));
@@ -94,7 +95,7 @@ try {
   for (const c of changes) writeFileSync(c.fullPath, c.after);
   writeFileSync(receiptFile, JSON.stringify({
     version: 2, packageRoot, packageVersion: pkg.version,
-    files: changes.map(c => ({ path: c.path, backupPath: relative(own, join(backupDir, c.path.split("/").at(-1))), originalHash: hash(c.before), installedHash: c.installedHash })),
+    files: changes.map(c => ({ path: c.path, backupPath: relative(storage, join(backupDir, c.path.split("/").at(-1))), originalHash: hash(c.before), installedHash: c.installedHash })),
   }, null, 2) + "\n");
 } catch (error) {
   for (const c of changes) writeFileSync(c.fullPath, c.before);

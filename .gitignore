@@ -1,3 +1,7 @@
+# 所有运行日志、备份和本机补丁记录均不发布
+/data/
+
+# 迁移前遗留记录仍忽略，避免误提交
 # 本机补丁记录包含绝对路径；上游源码备份不提交
 /compat/installed.json
 /compat/originals/
@@ -28,6 +32,8 @@
 # 依赖、构建与测试产物
 node_modules/
 dist/
+integrations/windows/bin/
+integrations/windows/obj/
 coverage/
 .nyc_output/
 *.tsbuildinfo

@@ -2,6 +2,9 @@
 # 仅修改当前用户开始菜单中的独立快捷方式，不更改通知权限和现有快捷方式。
 param(
   [string]$Executable = $env:WEZTERM_EXECUTABLE,
+  [ValidateSet('org.wezfurlong.wezterm', 'Pi.CommandAudit')]
+  [string]$AppId = 'org.wezfurlong.wezterm',
+  [string]$BackupDirectory,
   [switch]$TestNotification
 )
 $ErrorActionPreference = 'Stop'
@@ -9,7 +12,8 @@ if (-not $Executable -or -not (Test-Path -LiteralPath $Executable -PathType Leaf
   throw '请使用 -Executable 指定实际 wezterm-gui.exe 路径'
 }
 $Executable = (Resolve-Path -LiteralPath $Executable).Path
-if ([IO.Path]::GetFileName($Executable) -ne 'wezterm-gui.exe') { throw '目标必须为 wezterm-gui.exe' }
+$ExpectedExe = if ($AppId -eq 'Pi.CommandAudit') { 'ApprovalToast.exe' } else { 'wezterm-gui.exe' }
+if ([IO.Path]::GetFileName($Executable) -ne $ExpectedExe) { throw ('目标必须为 ' + $ExpectedExe) }
 
 # 使用 Windows Shell 的标准属性接口设置快捷方式身份。
 Add-Type -TypeDefinition @'
@@ -57,7 +61,7 @@ namespace PiWeztermNotification {
     void Commit();
   }
   public static class Shortcut {
-    public static void Create(string executable, string path) {
+    public static void Create(string executable, string path, string appId) {
       object obj = new ShellLink();
       IntPtr text = IntPtr.Zero;
       try {
@@ -67,7 +71,7 @@ namespace PiWeztermNotification {
         link.SetDescription("WezTerm - Pi approval notifications");
         link.SetIconLocation(executable, 0);
         var key = new PropertyKey { fmtid = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"), pid = 5 };
-        text = Marshal.StringToCoTaskMemUni("org.wezfurlong.wezterm");
+        text = Marshal.StringToCoTaskMemUni(appId);
         var value = new PropVariant { vt = 31, value = text };
         var store = (IPropertyStore)obj;
         store.SetValue(ref key, ref value);
@@ -83,18 +87,24 @@ namespace PiWeztermNotification {
 '@
 
 $Programs = [Environment]::GetFolderPath('Programs')
-$Shortcut = Join-Path $Programs 'WezTerm Pi Notifications.lnk'
+$ShortcutName = if ($AppId -eq 'Pi.CommandAudit') { 'Pi Command Audit.lnk' } else { 'WezTerm Pi Notifications.lnk' }
+$Shortcut = Join-Path $Programs $ShortcutName
 if (Test-Path -LiteralPath $Shortcut) {
-  $Backup = $Shortcut + '.backup-' + (Get-Date -Format 'yyyyMMdd-HHmmssfff')
+  if (-not $BackupDirectory) {
+    if (-not $PSScriptRoot) { throw '通过 scriptblock 调用时需显式提供扩展内的 -BackupDirectory' }
+    $BackupDirectory = Join-Path $PSScriptRoot '../data/backups/shortcuts'
+  }
+  [void](New-Item -ItemType Directory -Path $BackupDirectory -Force)
+  $Backup = Join-Path $BackupDirectory ($ShortcutName + '.backup-' + (Get-Date -Format 'yyyyMMdd-HHmmssfff'))
   Copy-Item -LiteralPath $Shortcut -Destination $Backup
   Write-Output ('已备份已有通知快捷方式：' + $Backup)
 }
-[PiWeztermNotification.Shortcut]::Create($Executable, $Shortcut)
+[PiWeztermNotification.Shortcut]::Create($Executable, $Shortcut, $AppId)
 $Shell = New-Object -ComObject Shell.Application
 try {
   $Item = $Shell.NameSpace($Programs).ParseName([IO.Path]::GetFileName($Shortcut))
   $Id = $Item.ExtendedProperty('System.AppUserModel.ID')
-  if ($Id -ne 'org.wezfurlong.wezterm') { throw '快捷方式 AppUserModelID 验证失败' }
+  if ($Id -ne $AppId) { throw '快捷方式 AppUserModelID 验证失败' }
   Write-Output ('快捷方式身份验证通过：' + $Id)
 } finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($Shell) }
 
@@ -105,7 +115,7 @@ if ($TestNotification) {
   $Xml.LoadXml('<toast><visual><binding template="ToastGeneric"><text>Pi 审批通知测试</text><text>这是一条测试提醒，不运行命令。请确认桌面横幅或通知中心是否出现。</text></binding></visual></toast>')
   $Toast = [Windows.UI.Notifications.ToastNotification]::new($Xml)
   $Toast.ExpirationTime = [DateTimeOffset]::Now.AddMinutes(1)
-  $Notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('org.wezfurlong.wezterm')
+  $Notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($AppId)
   Write-Output ('Windows 通知状态：' + $Notifier.Setting)
   $Notifier.Show($Toast)
   Write-Output '已向 Windows 提交通知。API 成功不代表横幅一定展示，请用户目视确认。'

@@ -1,7 +1,10 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { beginWeztermApproval, type NotificationOptions } from "./wezterm-notify.ts";
+import { createHash } from "node:crypto";
+import { createApproval, type ApprovalResult } from "./approval-state.ts";
+import { startDesktopApproval } from "./desktop-approval.ts";
 
-export type ApprovalOutcome = "approved" | "user_denied" | "cancelled" | "timeout" | "headless" | "error";
+export type ApprovalOutcome = ApprovalResult;
 export type AuditOutcome = ApprovalOutcome | "allowed" | "denied";
 export interface AuditCounters { allowed: number; denied: number; cancelled: number }
 
@@ -43,35 +46,32 @@ export async function requestApproval(
 ): Promise<ApprovalOutcome> {
   if (signal.aborted) return "cancelled";
   if (!ctx.hasUI) return "headless";
-  const timeout = new AbortController();
   const deadline = Date.now() + timeoutMs;
-  const timer = setTimeout(() => timeout.abort(), timeoutMs);
-  const combined = AbortSignal.any([signal, timeout.signal]);
-  let onAbort: (() => void) | undefined;
-  const endNotification = beginWeztermApproval(ctx, deadline, notification);
+  const operationHash = notification.operationHash ?? createHash("sha256").update(title + "\n" + message).digest("hex");
+  const state = createApproval(ctx.sessionManager?.getSessionId?.() ?? "ephemeral", operationHash, deadline, signal);
+  let stopDesktop: (() => void) | undefined;
+  let stopFallback: (() => void) | undefined;
+  let endNotification: (() => void) | undefined;
+  const fallback = () => {
+    if (state.signal.aborted || stopFallback) return;
+    try { ctx.ui.notify("桌面按钮通知不可用，已保留终端审批", "warning"); } catch {}
+    stopFallback = beginWeztermApproval(ctx, deadline, notification);
+  };
   try {
-    // confirm() 将 No、Esc、超时都压成 false；原生 select() 能保留明确拒绝。
-    // 默认选中拒绝，避免误按回车批准。沿用 Pi 自身的选择器和主题。
-    const choice = await Promise.race([
-      ctx.ui.select(`${title}\n\n${message}`, ["拒绝本次", "允许本次"], { signal: combined, timeout: timeoutMs }),
-      new Promise<undefined>(resolve => {
-        onAbort = () => resolve(undefined);
-        combined.addEventListener("abort", onAbort, { once: true });
-        if (combined.aborted) onAbort();
-      }),
-    ]);
-    if (signal.aborted) return "cancelled";
-    if (timeout.signal.aborted || Date.now() >= deadline) return "timeout";
-    if (choice === "允许本次") return "approved";
-    if (choice === "拒绝本次") return "user_denied";
-    return "cancelled";
-  } catch {
-    if (signal.aborted) return "cancelled";
-    if (timeout.signal.aborted || Date.now() >= deadline) return "timeout";
-    return "error";
+    if (notification.enabled && ctx.mode === "tui" && process.stdout.isTTY) {
+      // 桌面只显示脱敏摘要；通知明确提醒完整操作在终端，批准只作用于当前绑定请求。
+      stopDesktop = startDesktopApproval(state, title,
+        notification.summary ?? "当前终端等待审批。请先查看终端中的完整操作，再决定是否允许本次。", fallback);
+    }
+    endNotification = beginWeztermApproval(ctx, deadline, { ...notification, toast: !stopDesktop, approvalId: state.snapshot().id });
+    // 桌面和终端共同竞争同一个状态机；完成信号关闭另一端，不产生第二次决定。
+    void Promise.resolve().then(() => ctx.ui.select(`${title}\n\n${message}`, ["允许本次", "拒绝本次"],
+      { signal: state.signal, timeout: Math.max(1, deadline - Date.now()) })).then(choice => {
+        if (state.signal.aborted) return;
+        state.settle(choice === "允许本次" ? "approved" : choice === "拒绝本次" ? "user_denied" : "cancelled");
+      }, () => { state.settle("error"); });
+    return await state.result;
   } finally {
-    clearTimeout(timer);
-    endNotification();
-    if (onAbort) combined.removeEventListener("abort", onAbort);
+    state.dispose(); stopDesktop?.(); stopFallback?.(); endNotification?.();
   }
 }

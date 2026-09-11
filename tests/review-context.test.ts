@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { buildReviewContext } from "../review-context.ts";
-import { parseVerdict, parseConfig } from "../policy.ts";
+import { parseVerdict, parseConfig, parseModelReference } from "../policy.ts";
 
 const req = { kind: "tool" as const, tool: "bash", args: { command: "echo test" }, cwd: "/test" };
 const entry = (role: string, text: string) => ({ type: "message", message: { role, content: [{ type: "text", text }] } });
@@ -43,6 +43,17 @@ test("摘要和不确定项严格校验，同时兼容旧两字段模型结果",
   assert.equal(parseVerdict('{"decision":"ask","reason":"缺少内容","summary":"运行脚本","uncertainties":["脚本未读取"]}').summary, "运行脚本");
   for (const value of [{ summary: 1 }, { uncertainties: "未知" }, { uncertainties: [42] }, { uncertainties: Array(6).fill("未知") }]) {
     assert.throws(() => parseVerdict(JSON.stringify({ decision: "ask", reason: "测试", ...value })));
+  }
+});
+test("模型引用仅按首个斜杠拆分，保留模型 ID 中的斜杠", () => {
+  const model = "local-cpa/bella/glm-5.3-flash";
+  assert.equal(parseConfig({ model }).model, model);
+  assert.deepEqual(parseModelReference(model), { provider: "local-cpa", id: "bella/glm-5.3-flash" });
+  assert.equal(parseModelReference("current"), undefined);
+});
+test("拒绝旧模型对象和无效模型引用", () => {
+  for (const model of [{ provider: "local-cpa", id: "bella/glm-5.3-flash" }, null, [], 1, "", "bare-model", "/model", "provider/", " provider/model", "provider/model\n"]) {
+    assert.throws(() => parseConfig({ model }));
   }
 });
 test("通知开关严格校验，默认人工审批五分钟", () => {

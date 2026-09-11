@@ -7,7 +7,7 @@ function context(select: (...args: any[]) => Promise<string | undefined>, hasUI 
 }
 for (const [choice, outcome] of [["允许本次", "approved"], ["拒绝本次", "user_denied"], [undefined, "cancelled"]] as const) {
   test(`原生选择器保留结果：${outcome}`, async () => {
-    const ctx = context(async (_title, options) => { assert.equal(options[0], "拒绝本次"); return choice; });
+    const ctx = context(async (_title, options) => { assert.deepEqual(options, ["允许本次", "拒绝本次"]); return choice; });
     assert.equal(await requestApproval(ctx, "审核", "测试操作", new AbortController().signal, 1000), outcome);
   });
 }

@@ -10,7 +10,7 @@ export function stateSequence(id: string, expiresAt: number, pending: boolean): 
   const state = { version: 1, id, expiresAt, pending };
   return `\x1b]1337;SetUserVar=PI_AUDIT_APPROVAL=${Buffer.from(JSON.stringify(state)).toString("base64")}\x07`;
 }
-export interface NotificationOptions { enabled: boolean; summary?: string }
+export interface NotificationOptions { enabled: boolean; summary?: string; operationHash?: string; toast?: boolean; approvalId?: string }
 
 /** 输出到 Pi 自身终端，绝不向 pane 粘贴/执行命令。RPC 和后台会话禁止输出 OSC。 */
 export function beginWeztermApproval(
@@ -18,7 +18,7 @@ export function beginWeztermApproval(
   io = { env: process.env, isTTY: process.stdout.isTTY, write: (s: string) => { process.stdout.write(s); } },
 ): () => void {
   if (!options.enabled || ctx.mode !== "tui" || !io.isTTY || io.env.TERM_PROGRAM !== "WezTerm" || !/^\d+$/.test(io.env.WEZTERM_PANE ?? "")) return () => {};
-  const id = randomUUID();
+  const id = options.approvalId ?? randomUUID();
   const project = safeNotificationText(basename(ctx.cwd), 50);
   const pane = io.env.WEZTERM_PANE;
   const title = safeNotificationText(`Pi 等待审批 · ${project} · pane ${pane}`, 100);
@@ -26,7 +26,7 @@ export function beginWeztermApproval(
   const body = safeNotificationText(options.summary ?? "当前终端需要人工审批，请返回带 [审批] 标记的标签页选择允许或拒绝。通知关闭不代表已批准。");
   try {
     io.write(stateSequence(id, deadline, true));
-    io.write(`\x1b]777;notify;${title};${body}\x07`);
+    if (options.toast !== false) io.write(`\x1b]777;notify;${title};${body}\x07`);
   } catch {
     try { ctx.ui.notify("WezTerm 提醒发送失败，请在当前终端完成审批", "warning"); } catch { /* 宿主 UI 不可用时保持通知为尽力而为。 */ }
   }

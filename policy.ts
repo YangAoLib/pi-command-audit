@@ -11,7 +11,7 @@ export interface AuditRequest {
   origin?: string;
 }
 export interface Config {
-  model: "current" | { provider: string; id: string };
+  model: string;
   timeoutMs: number;
   confirmTimeoutMs: number;
   maxInputChars: number;
@@ -23,15 +23,23 @@ export const DEFAULT_CONFIG: Config = {
   maxInputChars: 24000, mcpAllow: [], weztermNotifications: true,
 };
 
+export function parseModelReference(value: string): { provider: string; id: string } | undefined {
+  if (value === "current") return undefined;
+  const slash = value.indexOf("/");
+  if (slash <= 0 || slash === value.length - 1 || /\s|[\x00-\x1f\x7f]/.test(value)) {
+    throw new Error("model 必须为 current 或 provider/模型id，例如 local-cpa/bella/glm-5.3-flash");
+  }
+  // 仅第一个斜杠分隔 provider，后面的斜杠属于模型 ID。
+  return { provider: value.slice(0, slash), id: value.slice(slash + 1) };
+}
+
 export function parseConfig(value: unknown): Config {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("配置必须是对象");
   const v = value as Record<string, unknown>;
   if (Object.keys(v).some(k => !Object.hasOwn(DEFAULT_CONFIG, k))) throw new Error("配置含未知字段");
   const c = { ...DEFAULT_CONFIG, ...v } as Config;
-  if (c.model !== "current" && (!c.model || typeof c.model !== "object" ||
-      typeof c.model.provider !== "string" || !c.model.provider || typeof c.model.id !== "string" || !c.model.id)) {
-    throw new Error("model 必须为 current 或包含 provider、id 的对象");
-  }
+  if (typeof c.model !== "string") throw new Error("model 必须为 current 或 provider/模型id 字符串");
+  parseModelReference(c.model);
   for (const k of ["timeoutMs", "confirmTimeoutMs", "maxInputChars"] as const) {
     if (!Number.isSafeInteger(c[k]) || c[k] < 1000 || c[k] > 300000) throw new Error(`${k} 超出范围`);
   }

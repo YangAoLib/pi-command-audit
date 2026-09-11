@@ -11,7 +11,7 @@ description: 在安装 pi-command-audit 命令审核扩展的环境中升级 pi-
 
 - 本 Skill 所在目录记为 `SKILL_DIR`，扩展根目录 `EXT = SKILL_DIR/../..`，操作前解析为绝对路径。
 - Pi 全局目录 `AGENT_DIR` 使用 `PI_CODING_AGENT_DIR`，未设置时为用户主目录下的 `.pi/agent`。不要把业务仓库当作插件目录。
-- 默认依赖位于 `AGENT_DIR/npm/node_modules/pi-subagents`。以 `EXT/compat/installed.json`、Pi settings 和实际 package.json 交叉确认；若实际使用的是项目安装、Git 安装或其它路径，停止套用默认命令，先确定生效来源。
+- 默认依赖位于 `AGENT_DIR/npm/node_modules/pi-subagents`。以 `EXT/data/compat/installed.json`、Pi settings 和实际 package.json 交叉确认；若实际使用的是项目安装、Git 安装或其它路径，停止套用默认命令，先确定生效来源。
 - 原文件备份、校验哈希和测试才是依据，不凭本 Skill 里列出的历史版本认定兼容。
 - 所有占位符必须替换为已验证的绝对路径/精确版本，不能直接运行含 `<目标版本>` 的命令。
 
@@ -30,7 +30,7 @@ description: 在安装 pi-command-audit 命令审核扩展的环境中升级 pi-
 
 - `EXT/README.md`
 - `EXT/compat/install.mjs`、`EXT/compat/uninstall.mjs`
-- `EXT/compat/installed.json`（存在时）
+- `EXT/data/compat/installed.json`（存在时）
 - `EXT/subagent-bridge.ts`、`EXT/external-approval.ts`
 - `EXT/tests/integration.mjs`
 - 当前 pi-subagents 的 package.json，以及匹配此次改动的文档。
@@ -52,7 +52,7 @@ npm view pi-subagents version dist.integrity --json
 
 ## 2. 暂存新版，先审查再替换
 
-在 `AGENT_DIR/command-audit-backups/upgrade-<目标版本>-<唯一时间戳>/` 创建本次独立备份目录，禁止覆盖旧备份。
+在 `EXT/data/backups/upgrade-<目标版本>-<唯一时间戳>/` 创建本次独立备份目录，禁止覆盖旧备份。
 
 下载到其 `staging/`，不安装、不执行包脚本：
 
@@ -62,7 +62,7 @@ npm pack pi-subagents@<目标版本> --ignore-scripts --pack-destination "<stagi
 
 检查包名、版本和 npm 报告的 integrity，安全解压到 staging。用新源码与旧版本的**未打补丁原文件**比较，不要只对比已打补丁文件。
 
-旧原文件位置以 installed.json 每条记录的 `backupPath` 为准；兼容旧记录的 `compat/originals/<文件名>`。当前安装器通常使用 `compat/originals/<版本>/<文件名>`。
+旧原文件位置以 data/compat/installed.json 每条记录的 `backupPath` 为准，相对于 `EXT/data/compat/` 解析。当前安装器使用 `data/compat/originals/<版本>/<文件名>`。若遇旧版目录，先按 README 迁移，不修改哈希掩盖不一致。
 
 重点审查：
 
@@ -81,7 +81,7 @@ npm pack pi-subagents@<目标版本> --ignore-scripts --pack-destination "<stagi
 
 至少备份到本次独立目录：
 
-- 整个 `EXT`，包括补丁记录、原文件和测试；
+- `EXT` 的源码、测试及 `data/compat/` 补丁记录/原文件；必须排除 `.git/`、`data/backups/`、运行日志，避免将本次备份递归复制进自己；
 - 当前已安装的 pi-subagents 包目录（含当前补丁）；
 - `AGENT_DIR/npm/package.json`、package-lock.json（存在时）；
 - `AGENT_DIR/settings.json`。

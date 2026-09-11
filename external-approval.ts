@@ -1,6 +1,15 @@
 import { createServer, request as httpRequest } from "node:http";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { redact, redactText } from "./policy.ts";
+import type { ApprovalResult } from "./approval-state.ts";
+
+export class ParentApprovalError extends Error {
+  readonly outcome: ApprovalResult;
+  constructor(outcome: ApprovalResult) {
+    super("外部 runner 或子代理未获人工批准：已拒绝、取消、超时或确认界面不可用，未启动");
+    this.outcome = outcome;
+  }
+}
 
 const ENV = "PI_COMMAND_AUDIT_APPROVAL";
 const MAX_BYTES = 64000;
@@ -20,7 +29,7 @@ export interface ApprovalBroker {
 
 // 仅监听本机；随机凭据由当前 Pi 进程传给后台 runner，不写入文件或日志。
 export async function startApprovalBroker(
-  confirm: (preview: string, signal: AbortSignal) => Promise<boolean>,
+  confirm: (preview: string, signal: AbortSignal, kind?: "tool" | "external") => Promise<boolean | ApprovalResult>,
   timeoutMs: number,
 ): Promise<ApprovalBroker> {
   const token = randomBytes(32).toString("hex");
@@ -45,19 +54,28 @@ export async function startApprovalBroker(
         if (Buffer.byteLength(body) > MAX_BYTES) throw new Error("请求过大");
       }
       const value = JSON.parse(body);
-      if (!value || typeof value.preview !== "string" || Object.keys(value).length !== 1) throw new Error("请求格式错误");
+      if (!value || typeof value.preview !== "string" || Object.keys(value).some(k => !["preview", "kind", "deadline"].includes(k)) ||
+          (value.kind !== undefined && value.kind !== "tool" && value.kind !== "external")) throw new Error("请求格式错误");
+      let requestTimer: ReturnType<typeof setTimeout> | undefined;
+      if (value.deadline !== undefined) {
+        if (!Number.isFinite(value.deadline) || value.deadline <= Date.now()) throw new Error("审批已过期");
+        requestTimer = setTimeout(() => controller.abort(), Math.min(timeoutMs, value.deadline - Date.now()));
+        controller.signal.addEventListener("abort", () => clearTimeout(requestTimer), { once: true });
+      }
       const task = queue.then(async () => {
         if (controller.signal.aborted) return false;
-        return await confirm(redactText(value.preview), controller.signal) === true && !controller.signal.aborted;
+        return await confirm(redactText(value.preview), controller.signal, value.kind ?? "external");
       });
       queue = task.catch(() => false);
-      const allowed = await new Promise<boolean>((resolve) => {
+      const decision = await new Promise<boolean | ApprovalResult>((resolve) => {
         const abort = () => resolve(false);
         controller.signal.addEventListener("abort", abort, { once: true });
         if (controller.signal.aborted) abort();
         task.then(resolve, () => resolve(false)).finally(() => controller.signal.removeEventListener("abort", abort));
       });
-      if (!res.destroyed) res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ allowed: allowed && !controller.signal.aborted }));
+      const allowed = (decision === true || decision === "approved") && !controller.signal.aborted;
+      const outcome = controller.signal.aborted ? "timeout" : typeof decision === "string" ? decision : allowed ? "approved" : "user_denied";
+      if (!res.destroyed) res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ allowed, outcome }));
     } catch {
       if (!res.destroyed) res.writeHead(400).end(JSON.stringify({ allowed: false }));
     } finally { clearTimeout(timer); controller.abort(); active.delete(controller); }
@@ -86,8 +104,19 @@ export async function startApprovalBroker(
 }
 
 export async function confirmExternalRunner(input: ExternalLaunch): Promise<void> {
+  const preview = JSON.stringify(redact({
+    runner: input.command ? "external-cli" : "external-job",
+    command: input.command, args: input.args, provider: input.provider, options: input.options,
+    cwd: input.cwd, prompt: input.prompt,
+  }), null, 2);
+  await requestParentApproval(preview, "external", undefined, undefined, input);
+}
+
+/** 子代理请求转交父会话的人类；没有 UI 通道则失败，不由父 AI 自动批准。 */
+export async function requestParentApproval(preview: string, kind: "tool" | "external", signal?: AbortSignal,
+  deadline?: number, input?: Pick<ExternalLaunch, "registerStop" | "registerTimeout">): Promise<void> {
   const raw = process.env[ENV];
-  if (!raw) throw new Error("外部 runner 启动需要人工确认，但没有可用的 Pi 确认界面");
+  if (!raw) throw new Error("外部 runner 或子代理需要人工确认，但没有可用的 Pi 确认界面");
   let endpoint: { port: number; token: string; timeoutMs: number };
   try {
     endpoint = JSON.parse(raw);
@@ -95,19 +124,17 @@ export async function confirmExternalRunner(input: ExternalLaunch): Promise<void
         !/^[a-f0-9]{64}$/.test(endpoint.token) || !Number.isInteger(endpoint.timeoutMs) ||
         endpoint.timeoutMs < 1000 || endpoint.timeoutMs > 300000) throw new Error();
   } catch { throw new Error("外部 runner 确认通道无效，已阻止启动"); }
-  const preview = JSON.stringify(redact({
-    runner: input.command ? "external-cli" : "external-job",
-    command: input.command, args: input.args, provider: input.provider, options: input.options,
-    cwd: input.cwd, prompt: input.prompt,
-  }), null, 2);
-  const body = JSON.stringify({ preview });
+  const body = JSON.stringify({ preview: redactText(preview), kind, ...(deadline !== undefined ? { deadline } : {}) });
   if (Buffer.byteLength(body) > MAX_BYTES) throw new Error("外部启动参数过长，不能完整展示，请缩小任务后再确认");
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), endpoint.timeoutMs + 2000);
-  input.registerStop?.(() => controller.abort());
-  input.registerTimeout?.(() => controller.abort());
+  const cancel = () => controller.abort();
+  signal?.addEventListener("abort", cancel, { once: true });
+  if (signal?.aborted) cancel();
+  input?.registerStop?.(cancel);
+  input?.registerTimeout?.(cancel);
   try {
-    const allowed = await new Promise<boolean>((resolve, reject) => {
+    const decision = await new Promise<{ allowed: boolean; outcome?: ApprovalResult }>((resolve, reject) => {
       const req = httpRequest({ host: "127.0.0.1", port: endpoint.port, path: "/approve", method: "POST",
         signal: controller.signal, headers: { Authorization: `Bearer ${endpoint.token}`, "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
       }, res => {
@@ -115,17 +142,27 @@ export async function confirmExternalRunner(input: ExternalLaunch): Promise<void
         res.on("data", chunk => { result += chunk.toString(); if (result.length > 1024) req.destroy(new Error("响应过长")); });
         res.on("error", reject);
         res.on("end", () => {
-          try { resolve(res.statusCode === 200 && JSON.parse(result).allowed === true); } catch { resolve(false); }
+          try {
+            const value = JSON.parse(result);
+            resolve({ allowed: res.statusCode === 200 && value.allowed === true, outcome: value.outcome });
+          } catch { resolve({ allowed: false }); }
         });
       });
       req.on("error", reject);
       req.end(body);
     });
-    if (!allowed || controller.signal.aborted) throw new Error();
-  } catch { throw new Error("外部 runner 未获人工批准：已拒绝、取消、超时或确认界面不可用，未启动"); }
+    if (!decision.allowed || controller.signal.aborted) {
+      const outcome = signal?.aborted ? "cancelled" : ["user_denied", "cancelled", "timeout", "headless", "error"].includes(decision.outcome ?? "") ? decision.outcome! : "error";
+      throw new ParentApprovalError(outcome);
+    }
+  } catch (error) {
+    if (error instanceof ParentApprovalError) throw error;
+    throw new ParentApprovalError(signal?.aborted ? "cancelled" : controller.signal.aborted ? "timeout" : "error");
+  }
   finally {
     clearTimeout(timer);
-    input.registerStop?.(undefined);
-    input.registerTimeout?.(undefined);
+    signal?.removeEventListener("abort", cancel);
+    input?.registerStop?.(undefined);
+    input?.registerTimeout?.(undefined);
   }
 }

@@ -1,10 +1,29 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { startApprovalBroker, confirmExternalRunner } from "../external-approval.ts";
+import { startApprovalBroker, confirmExternalRunner, requestParentApproval, ParentApprovalError } from "../external-approval.ts";
 
 const launch = { command: "虚拟工具", args: ["--read-only"], cwd: process.cwd(), prompt: "虚拟任务" };
 
+test("原生子代理 ask 转发到父界面，不自动当作外部启动", async () => {
+  let count = 0;
+  const broker = await startApprovalBroker(async (preview, signal, kind) => {
+    assert.equal(kind, "tool"); assert.match(preview, /虚拟修改/); count++; return "approved";
+  }, 2000);
+  try { await requestParentApproval("虚拟修改", "tool", undefined, Date.now() + 1000); assert.equal(count, 1); }
+  finally { await broker.close(); }
+});
+test("父界面明确拒绝的原因能传回子代理", async () => {
+  const broker = await startApprovalBroker(async () => "user_denied", 2000);
+  try { await assert.rejects(requestParentApproval("测试", "tool"), e => e instanceof ParentApprovalError && e.outcome === "user_denied"); }
+  finally { await broker.close(); }
+});
+test("子代理截止时间过期不能由父界面迟到批准", async () => {
+  let confirms = 0;
+  const broker = await startApprovalBroker(async () => { confirms++; return "approved"; }, 2000);
+  try { await assert.rejects(requestParentApproval("测试", "tool", undefined, Date.now() - 1)); assert.equal(confirms, 0); }
+  finally { await broker.close(); }
+});
 test("无确认通道时不启动", async () => {
   const old = process.env.PI_COMMAND_AUDIT_APPROVAL;
   delete process.env.PI_COMMAND_AUDIT_APPROVAL;

@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { dataRoot } from "../data-paths.ts";
+import { randomUUID } from "node:crypto";
 import commandAudit, { MCP_APPROVAL_EVENT } from "../index.ts";
 import { DEFAULT_CONFIG, localDecision, parseConfig, parseVerdict, redact, type AuditRequest } from "../policy.ts";
 
@@ -76,6 +78,7 @@ function fixture(options: { ui?: boolean; answer?: string; confirm?: boolean; co
   const dir = mkdtempSync(join(tmpdir(), "pi-command-audit-test-"));
   const old = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = dir;
+  const sessionId = randomUUID();
   const handlers = new Map<string, Function>();
   const bus = new Map<string, Function>();
   const calls: unknown[] = [];
@@ -84,7 +87,7 @@ function fixture(options: { ui?: boolean; answer?: string; confirm?: boolean; co
   const statuses: string[] = [];
   const ctx = {
     cwd: dir, hasUI: options.ui ?? false, model: { provider: "fixture", id: "fixture" },
-    sessionManager: { getSessionId: () => "fixture-session" },
+    sessionManager: { getSessionId: () => sessionId },
     ui: {
       theme: { fg: (color: string, text: string) => `<${color}>${text}</${color}>` },
       setStatus(_key: string, text: string) { statuses.push(text); },
@@ -105,7 +108,7 @@ function fixture(options: { ui?: boolean; answer?: string; confirm?: boolean; co
   } as any);
   if (old === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = old;
   const ready = handlers.get("session_start")!({}, ctx);
-  return { dir, handlers, bus, ctx, calls, notices, levels, statuses,
+  return { dir, handlers, bus, ctx, calls, notices, levels, statuses, sessionId,
     invoke: async (toolName: string, input: Record<string, unknown>) => {
       await ready;
       return handlers.get("tool_call")!({ toolName, input }, ctx);
@@ -120,8 +123,10 @@ test("未知工具调用模型且模型不携带工具", async () => {
     assert.equal(await f.invoke("custom_execute", { action: "inspect" }), undefined);
     assert.equal(f.calls.length, 1);
     assert.equal((f.calls[0] as any)[1].tools, undefined);
-    const files = await import("node:fs").then(fs => fs.readdirSync(join(f.dir, "command-audit-logs")));
-    const log = readFileSync(join(f.dir, "command-audit-logs", files[0]), "utf8");
+    const files = await import("node:fs").then(fs => fs.readdirSync(join(dataRoot, "logs")));
+    const log = files.flatMap(file => readFileSync(join(dataRoot, "logs", file), "utf8").trim().split("\n"))
+      .filter(line => JSON.parse(line).sessionId === f.sessionId).join("\n");
+    assert.ok(log.length > 0);
     assert.ok(!log.includes("inspect")); assert.ok(!log.includes("custom_execute"));
   } finally { f.dispose(); }
 });
@@ -143,8 +148,9 @@ test("手动拒绝记录最终结果，不再重复初审理由或使用黄色�
     assert.match(f.statuses.at(-1)!, /<error>拒绝 1/);
     assert.match(f.statuses.at(-1)!, /<dim>放行 0/);
     const { readdirSync } = await import("node:fs");
-    const file = readdirSync(join(f.dir, "command-audit-logs"))[0];
-    const entry = JSON.parse(readFileSync(join(f.dir, "command-audit-logs", file), "utf8").trim());
+    const entry = readdirSync(join(dataRoot, "logs"))
+      .flatMap(file => readFileSync(join(dataRoot, "logs", file), "utf8").trim().split("\n").map(line => JSON.parse(line)))
+      .find(row => row.sessionId === f.sessionId);
     assert.equal(entry.decision, "ask");
     assert.equal(entry.outcome, "user_denied");
     assert.equal(entry.allowed, false);

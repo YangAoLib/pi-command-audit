@@ -4,13 +4,14 @@ import { dirname, join, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 const own = dirname(fileURLToPath(import.meta.url));
-const receiptPath = join(own, "installed.json");
+const storage = join(own, "../data/compat");
+const receiptPath = join(storage, "installed.json");
 const receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
 const hash = data => createHash("sha256").update(data).digest("hex");
 const changes = receipt.files.map(file => {
   const target = join(receipt.packageRoot, file.path);
   const current = readFileSync(target);
-  const original = readFileSync(file.backupPath ? join(own, file.backupPath) : join(own, "originals", basename(file.path)));
+  const original = readFileSync(file.backupPath ? join(storage, file.backupPath) : join(storage, "originals", basename(file.path)));
   if (hash(current) !== file.installedHash || hash(original) !== file.originalHash) {
     throw new Error(`校验不符，未恢复任何文件：${file.path}；请人工检查依赖版本`);
   }
